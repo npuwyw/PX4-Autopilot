@@ -52,9 +52,13 @@ jobs:
             git config --global --add safe.directory /workspace
             make ${{ matrix.check }}
 
-  python-checks:
-    name: Python CI Checks
+  mavsdk-python-checks:
+    name: MAVSDK Python [${{ matrix.check }}]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        check: ["mypy", "flake8"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,13 +69,15 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install tools
+      - name: Install Python tools
         run: pip install mypy types-requests flake8
 
       - name: Check MAVSDK test scripts with mypy
+        if: matrix.check == 'mypy'
         run: mypy --strict test/mavsdk_tests/*.py
 
       - name: Check MAVSDK test scripts with flake8
+        if: matrix.check == 'flake8'
         run: flake8 test/mavsdk_tests/*.py
 
   # ═══════════════════════════════════════════════════════════════════
@@ -81,7 +87,7 @@ jobs:
 
   basic-tests:
     name: Basic Tests [${{ matrix.check }}]
-    needs: [gate-checks, python-checks]
+    needs: [gate-checks, mavsdk-python-checks]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
@@ -108,7 +114,7 @@ jobs:
 
   clang-tidy:
     name: Clang-Tidy Static Analysis
-    needs: [gate-checks, python-checks]
+    needs: [gate-checks, mavsdk-python-checks]
     runs-on: ubuntu-latest
     container:
       image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
@@ -128,7 +134,7 @@ jobs:
 
   ekf-functional-check:
     name: EKF Functional Change Indicator
-    needs: [gate-checks, python-checks]
+    needs: [gate-checks, mavsdk-python-checks]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     container:
@@ -141,20 +147,16 @@ jobs:
       - name: Git ownership workaround
         run: git config --system --add safe.directory '*'
 
-      - name: Build EKF unit tests
-        run: make test_ekf2_unittest
-
-      - name: Run EKF unit tests
-        run: make test_results_ekf2_unittest
+      - name: Run EKF tests
+        run: make tests TESTFILTER=EKF
 
       - name: Check for functional changes
-        run: |
-          git diff --exit-code test/results/ekf2_change_indicator.csv || \
-          (echo "::warning::EKF functional changes detected" && exit 0)
+        run: git diff --exit-code
+        working-directory: src/modules/ekf2/test/change_indication
 
   nuttx-env-config:
     name: NuttX Environment Config
-    needs: [gate-checks, python-checks]
+    needs: [gate-checks, mavsdk-python-checks]
     runs-on: ubuntu-latest
     container:
       image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
@@ -711,14 +713,14 @@ jobs:
 
   ci-summary:
     name: CI Summary
-    needs: [gate-checks, python-checks, basic-tests, clang-tidy, ubuntu-builds, macos-build, sitl-tests, ros-integration-tests]
+    needs: [gate-checks, mavsdk-python-checks, basic-tests, clang-tidy, ubuntu-builds, macos-build, sitl-tests, ros-integration-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check Tier 1 Status
         run: |
           echo "Tier 1 (Gate Checks): ${{ needs.gate-checks.result }}"
-          echo "Tier 1 (Python): ${{ needs.python-checks.result }}"
+          echo "Tier 1 (MAVSDK Python): ${{ needs.mavsdk-python-checks.result }}"
 
       - name: Check Tier 2 Status
         run: |
@@ -737,7 +739,7 @@ jobs:
 
       - name: Overall Result
         run: |
-          if [ "${{ needs.gate-checks.result }}" != "success" ] || [ "${{ needs.python-checks.result }}" != "success" ]; then
+          if [ "${{ needs.gate-checks.result }}" != "success" ] || [ "${{ needs.mavsdk-python-checks.result }}" != "success" ]; then
             echo "❌ Failed at Tier 1 (Gate Checks) - Stopped early to save costs"
             exit 1
           elif [ "${{ needs.basic-tests.result }}" != "success" ] || [ "${{ needs.clang-tidy.result }}" != "success" ]; then
