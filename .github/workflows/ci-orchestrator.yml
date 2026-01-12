@@ -169,10 +169,10 @@ jobs:
 
   clang-tidy:
     name: Clang-Tidy Static Analysis
-    needs: [build-sitl]
+    needs: [gate-checks, mavsdk-python-checks]
     runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
     container:
-      image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+      image: px4io/px4-dev-clang:2021-09-08
     steps:
       - uses: runs-on/action@v2
 
@@ -187,10 +187,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
-          key: sitl-ccache-${{ github.sha }}
+          key: clang-tidy-ccache-${{ github.sha }}
           restore-keys: |
-            sitl-ccache-${{ github.base_ref || github.ref_name }}-
-            sitl-ccache-
+            clang-tidy-ccache-${{ github.base_ref || github.ref_name }}-
+            clang-tidy-ccache-
 
       - name: Configure ccache
         run: |
@@ -202,15 +202,20 @@ jobs:
           echo "hash_dir = false" >> ~/.ccache/ccache.conf
           echo "compiler_check = content" >> ~/.ccache/ccache.conf
           ccache -s
-
-      - name: make px4_sitl_default
-        run: make px4_sitl_default
-
-      - name: Show ccache stats after build
-        run: ccache -s
+          ccache -z
 
       - name: make clang-tidy
         run: make clang-tidy
+
+      - name: Show ccache stats
+        run: ccache -s
+
+      - name: Cache Save
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: clang-tidy-ccache-${{ github.sha }}
 
   ekf-functional-check:
     name: EKF Functional Change Indicator
