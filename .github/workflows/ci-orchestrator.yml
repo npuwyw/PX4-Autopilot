@@ -1,0 +1,754 @@
+name: CI Pipeline (Orchestrator)
+
+on:
+  push:
+    branches:
+      - 'main'
+      - 'stable'
+      - 'beta'
+      - 'release/**'
+    paths-ignore:
+      - 'docs/**'
+  pull_request:
+    branches:
+      - '**'
+    paths-ignore:
+      - 'docs/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 1: Quick Gate Checks (2-5 min, GitHub-hosted)
+  # These are the fastest checks that catch most common errors
+  # If any of these fail, we stop immediately to save costs
+  # ═══════════════════════════════════════════════════════════════════
+
+  gate-checks:
+    name: Gate Checks [${{ matrix.check }}]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true  # Stop all jobs immediately on first failure
+      matrix:
+        check: [
+          "check_format",
+          "check_newlines",
+          "shellcheck_all"
+        ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Running ${{ matrix.check }}
+        uses: addnab/docker-run-action@v3
+        with:
+          image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+          options: -v ${{ github.workspace }}:/workspace
+          run: |
+            cd /workspace
+            git config --global --add safe.directory /workspace
+            make ${{ matrix.check }}
+
+  python-checks:
+    name: Python CI Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install tools
+        run: pip install mypy types-requests flake8
+
+      - name: Check MAVSDK test scripts with mypy
+        run: mypy --strict test/mavsdk_tests/*.py
+
+      - name: Check MAVSDK test scripts with flake8
+        run: flake8 test/mavsdk_tests/*.py
+
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 2: Basic Builds & Static Analysis (10-15 min, GitHub-hosted)
+  # Only runs if Tier 1 passes completely
+  # ═══════════════════════════════════════════════════════════════════
+
+  basic-tests:
+    name: Basic Tests [${{ matrix.check }}]
+    needs: [gate-checks, python-checks]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        check: [
+          "tests",
+          "validate_module_configs",
+          "module_documentation"
+        ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Building [${{ matrix.check }}]
+        uses: addnab/docker-run-action@v3
+        with:
+          image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+          options: -v ${{ github.workspace }}:/workspace
+          run: |
+            cd /workspace
+            git config --global --add safe.directory /workspace
+            make ${{ matrix.check }}
+
+  clang-tidy:
+    name: Clang-Tidy Static Analysis
+    needs: [gate-checks, python-checks]
+    runs-on: ubuntu-latest
+    container:
+      image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: make px4_sitl_default
+        run: make px4_sitl_default
+
+      - name: make clang-tidy
+        run: make clang-tidy
+
+  ekf-functional-check:
+    name: EKF Functional Change Indicator
+    needs: [gate-checks, python-checks]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    container:
+      image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Build EKF unit tests
+        run: make test_ekf2_unittest
+
+      - name: Run EKF unit tests
+        run: make test_results_ekf2_unittest
+
+      - name: Check for functional changes
+        run: |
+          git diff --exit-code test/results/ekf2_change_indicator.csv || \
+          (echo "::warning::EKF functional changes detected" && exit 0)
+
+  nuttx-env-config:
+    name: NuttX Environment Config
+    needs: [gate-checks, python-checks]
+    runs-on: ubuntu-latest
+    container:
+      image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [px4_fmu-v5_default]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Build ${{ matrix.config }}
+        run: make ${{ matrix.config }}
+        env:
+          EXTRA_CMAKE_ARGS: -DCONFIG_CUSTOM_APPS=y
+
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 3: Platform Builds & Hardware Checks (15-30 min, Mixed runners)
+  # Only runs if Tier 2 passes completely
+  # These include expensive macOS builds and AWS-hosted builds
+  # ═══════════════════════════════════════════════════════════════════
+
+  ubuntu-builds:
+    name: Ubuntu Build [${{ matrix.container }}]
+    needs: [basic-tests, clang-tidy, ekf-functional-check, nuttx-env-config]
+    if: always() && needs.basic-tests.result == 'success' && needs.clang-tidy.result == 'success' && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    strategy:
+      fail-fast: false
+      matrix:
+        container: [
+          "ubuntu:22.04",
+          "ubuntu:24.04"
+        ]
+    container:
+      image: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup environment
+        run: |
+          apt-get update
+          apt-get install -y git make cmake python3 python3-pip
+
+      - name: Install PX4 dependencies
+        run: ./Tools/setup/ubuntu.sh --no-nuttx --no-sim-tools
+
+      - name: Build px4_sitl_default
+        run: make px4_sitl_default
+
+  macos-build:
+    name: MacOS Build [${{ matrix.config }}]
+    needs: [basic-tests, clang-tidy, ekf-functional-check, nuttx-env-config]
+    if: always() && needs.basic-tests.result == 'success' && needs.clang-tidy.result == 'success' && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [
+          px4_fmu-v5_default,
+          px4_sitl
+        ]
+    steps:
+      - name: Install Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup
+        run: ./Tools/setup/macos.sh
+
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        shell: cmake -P {0}
+        run: |
+          string(TIMESTAMP current_date "%Y-%m-%d-%H;%M;%S" UTC)
+          message("::set-output name=timestamp::${current_date}")
+
+      - name: ccache cache files
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: macos_${{matrix.config}}-ccache-${{steps.ccache_cache_timestamp.outputs.timestamp}}
+          restore-keys: macos_${{matrix.config}}-ccache-
+
+      - name: Setup ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 40M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Make ${{matrix.config}}
+        run: |
+          ccache -z
+          make ${{matrix.config}}
+          ccache -s
+
+  itcm-check:
+    name: ITCM Check [${{ matrix.config }}]
+    needs: [basic-tests, clang-tidy, ekf-functional-check, nuttx-env-config]
+    if: always() && needs.basic-tests.result == 'success' && needs.clang-tidy.result == 'success' && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [
+          px4_fmu-v5x_default,
+          px4_fmu-v6xrt_default,
+          nxp_tropic-community_default,
+          nxp_mr-tropic_default
+        ]
+    container:
+      image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Build ${{ matrix.config }}
+        run: make ${{ matrix.config }}
+
+      - name: Check ITCM usage
+        run: |
+          arm-none-eabi-size build/*_default/bin/*.elf
+
+  flash-analysis:
+    name: Flash Analysis [${{ matrix.config }}]
+    needs: [basic-tests, clang-tidy, ekf-functional-check, nuttx-env-config]
+    if: always() && needs.basic-tests.result == 'success' && needs.clang-tidy.result == 'success' && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [
+          px4_fmu-v5x_default,
+          px4_fmu-v6x_default
+        ]
+    container:
+      image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Build ${{ matrix.config }}
+        run: make ${{ matrix.config }}
+
+      - name: Install bloaty
+        run: |
+          apt-get update && apt-get install -y bloaty
+
+      - name: Run bloaty analysis
+        run: |
+          bloaty build/*_default/bin/*.elf --domain=vm -d compileunits -n 50
+
+  failsafe-sim:
+    name: Failsafe Web Simulator
+    needs: [basic-tests, clang-tidy, ekf-functional-check, nuttx-env-config]
+    if: always() && needs.basic-tests.result == 'success' && needs.clang-tidy.result == 'success' && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
+    runs-on: ubuntu-latest
+    container:
+      image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Setup emsdk
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git
+          cd emsdk
+          ./emsdk install 3.1.50
+          ./emsdk activate 3.1.50
+
+      - name: Build failsafe_web
+        run: |
+          source emsdk/emsdk_env.sh
+          make failsafe_web
+
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 4: Integration Tests (30-45 min, AWS Self-hosted)
+  # Only runs if Tier 3 passes completely
+  # These are the most expensive tests - SITL simulations and ROS
+  # ═══════════════════════════════════════════════════════════════════
+
+  sitl-tests:
+    name: SITL Tests [${{ matrix.config.model }}]
+    needs: [ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: always() && needs.ubuntu-builds.result == 'success' && needs.macos-build.result == 'success' && needs.itcm-check.result == 'success' && needs.flash-analysis.result == 'success'
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu22-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    container:
+      image: px4io/px4-dev-simulation-focal:2021-09-08
+      options: --privileged --ulimit core=-1 --security-opt seccomp=unconfined
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          # For PRs, only run iris. For main, run all models
+          - {model: "iris", latitude: "59.617693", longitude: "-151.145316", altitude: "48", build_type: "RelWithDebInfo"}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git Ownership Workaround
+        run: git config --system --add safe.directory '*'
+
+      - id: set-timestamp
+        name: Set timestamp for cache
+        run: echo "::set-output name=timestamp::$(date +"%Y%m%d%H%M%S")"
+
+      - name: Cache Key Config
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: sitl-ccache-${{ steps.set-timestamp.outputs.timestamp }}
+          restore-keys: sitl-ccache-
+
+      - name: Cache Conf Config
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 120M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Build PX4
+        env:
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+        run: make px4_sitl_default
+
+      - name: Cache Post-Run [px4_sitl_default]
+        run: ccache -s
+
+      - name: Build SITL Gazebo
+        env:
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+        run: make px4_sitl_default sitl_gazebo-classic
+
+      - name: Cache Post-Run [sitl_gazebo-classic]
+        run: ccache -s
+
+      - name: Download MAVSDK
+        run: wget "https://github.com/mavlink/MAVSDK/releases/download/v$(cat test/mavsdk_tests/MAVSDK_VERSION)/libmavsdk-dev_$(cat test/mavsdk_tests/MAVSDK_VERSION)_ubuntu22.04_amd64.deb"
+
+      - name: Install MAVSDK
+        run: dpkg -i "libmavsdk-dev_$(cat test/mavsdk_tests/MAVSDK_VERSION)_ubuntu22.04_amd64.deb"
+
+      - name: Check PX4 Environment Variables
+        env:
+          PX4_HOME_LAT: ${{matrix.config.latitude}}
+          PX4_HOME_LON: ${{matrix.config.longitude}}
+          PX4_HOME_ALT: ${{matrix.config.altitude}}
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+        run: |
+          export
+          ulimit -a
+
+      - name: Build PX4 / MAVSDK tests
+        env:
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+          DONT_RUN: 1
+        run: make px4_sitl_default sitl_gazebo-classic mavsdk_tests
+
+      - name: Cache Post-Run [px4_sitl_default sitl_gazebo-classic mavsdk_tests]
+        run: ccache -s
+
+      - name: Core Dump Settings
+        run: |
+          ulimit -c unlimited
+          echo "`pwd`/%e.core" > /proc/sys/kernel/core_pattern
+
+      - name: Run SITL / MAVSDK Tests
+        env:
+          PX4_HOME_LAT: ${{matrix.config.latitude}}
+          PX4_HOME_LON: ${{matrix.config.longitude}}
+          PX4_HOME_ALT: ${{matrix.config.altitude}}
+          PX4_CMAKE_BUILD_TYPE: ${{matrix.config.build_type}}
+        run: test/mavsdk_tests/mavsdk_test_runner.py --speed-factor 10 --abort-early --model ${{matrix.config.model}} test/mavsdk_tests/configs/sitl.json --verbose --force-color
+        timeout-minutes: 45
+
+      - name: Upload failed logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-${{matrix.config.model}}-logs.zip
+          path: |
+            logs/**/**/**/*.log
+            logs/**/**/**/*.ulg
+            build/px4_sitl_default/tmp_mavsdk_tests/rootfs/log/**/*.ulg
+
+  ros-integration-tests:
+    name: ROS Integration Tests
+    needs: [ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: always() && needs.ubuntu-builds.result == 'success' && needs.macos-build.result == 'success' && needs.itcm-check.result == 'success' && needs.flash-analysis.result == 'success'
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu22-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    container:
+      image: px4io/px4-dev-ros2-galactic:2021-09-08
+      options: --privileged --ulimit core=-1 --security-opt seccomp=unconfined
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git Ownership Workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Update ROS Keys
+        run: |
+          sudo rm /etc/apt/sources.list.d/ros2.list && \
+          sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+
+      - name: Install gazebo
+        run: apt update && apt install -y gazebo11 libgazebo11-dev gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly libgstreamer-plugins-base1.0-dev
+
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        shell: cmake -P {0}
+        run: |
+          string(TIMESTAMP current_date "%Y-%m-%d-%H;%M;%S" UTC)
+          message("::set-output name=timestamp::${current_date}")
+
+      - name: ccache cache files
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ros_integration_tests-ccache-${{steps.ccache_cache_timestamp.outputs.timestamp}}
+          restore-keys: ros_integration_tests-ccache-
+
+      - name: Setup ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 300M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Get and build micro-xrce-dds-agent
+        run: |
+          cd /opt
+          git clone --recursive https://github.com/eProsima/Micro-XRCE-DDS-Agent.git
+          cd Micro-XRCE-DDS-Agent
+          git checkout v2.2.1
+          sed -i 's/_fastdds_tag 2.8.x/_fastdds_tag 2.8.2/g' CMakeLists.txt
+          mkdir build
+          cd build
+          cmake ..
+          make -j2
+
+      - name: ccache post-run micro-xrce-dds-agent
+        run: ccache -s
+
+      - name: Get and build the ros2 interface library
+        shell: bash
+        run: |
+          PX4_DIR="$(pwd)"
+          . /opt/ros/galactic/setup.bash
+          mkdir -p /opt/px4_ws/src
+          cd /opt/px4_ws/src
+          git clone --recursive https://github.com/Auterion/px4-ros2-interface-lib.git
+          cd ..
+          "${PX4_DIR}/Tools/copy_to_ros_ws.sh" "$(pwd)"
+          rm -rf src/translation_node src/px4_msgs_old
+          colcon build --symlink-install
+
+      - name: ccache post-run ros workspace
+        run: ccache -s
+
+      - name: Build PX4
+        run: make px4_sitl_default
+
+      - name: ccache post-run px4/firmware
+        run: ccache -s
+
+      - name: Build SITL Gazebo
+        run: make px4_sitl_default sitl_gazebo-classic
+
+      - name: ccache post-run sitl_gazebo-classic
+        run: ccache -s
+
+      - name: Core dump settings
+        run: |
+          ulimit -c unlimited
+          echo "`pwd`/%e.core" > /proc/sys/kernel/core_pattern
+
+      - name: Run tests
+        shell: bash
+        run: |
+          . /opt/px4_ws/install/setup.bash
+          /opt/Micro-XRCE-DDS-Agent/build/MicroXRCEAgent udp4 localhost -p 8888 -v 0 &
+          test/ros_test_runner.py --verbose --model iris --upload --force-color
+        timeout-minutes: 45
+
+      - name: Upload failed logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-ros-logs.zip
+          path: |
+            logs/**/**/**/*.log
+            logs/**/**/**/*.ulg
+            build/px4_sitl_default/tmp_ros_tests/rootfs/log/**/*.ulg
+
+  mavros-mission-tests:
+    name: MAVROS Mission Tests
+    needs: [ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: always() && needs.ubuntu-builds.result == 'success' && needs.macos-build.result == 'success' && needs.itcm-check.result == 'success' && needs.flash-analysis.result == 'success'
+    runs-on: ubuntu-latest
+    container:
+      image: px4io/px4-dev-ros-noetic:2021-09-08
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Build SITL and Gazebo
+        run: |
+          . /opt/ros/noetic/setup.bash
+          make px4_sitl_default gazebo
+
+      - name: Run mission tests
+        run: |
+          . /opt/ros/noetic/setup.bash
+          test/rostest_px4_run.sh mavros_posix_tests_missions.test mission:=MC_mission_box vehicle:=iris
+        timeout-minutes: 30
+
+  mavros-offboard-tests:
+    name: MAVROS Offboard Tests
+    needs: [ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: always() && needs.ubuntu-builds.result == 'success' && needs.macos-build.result == 'success' && needs.itcm-check.result == 'success' && needs.flash-analysis.result == 'success'
+    runs-on: ubuntu-latest
+    container:
+      image: px4io/px4-dev-ros-noetic:2021-09-08
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Build SITL and Gazebo
+        run: |
+          . /opt/ros/noetic/setup.bash
+          make px4_sitl_default gazebo
+
+      - name: Run offboard tests
+        run: |
+          . /opt/ros/noetic/setup.bash
+          test/rostest_px4_run.sh mavros_posix_tests_offboard_posctl.test vehicle:=iris
+        timeout-minutes: 30
+
+  ros-translation-node:
+    name: ROS Translation Node [${{ matrix.ros_distro }}]
+    needs: [ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
+    if: always() && needs.ubuntu-builds.result == 'success' && needs.macos-build.result == 'success' && needs.itcm-check.result == 'success' && needs.flash-analysis.result == 'success'
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ros_distro: humble
+            ubuntu_distro: jammy
+          - ros_distro: jazzy
+            ubuntu_distro: noble
+    container:
+      image: px4io/px4-dev-ros2-${{ matrix.ros_distro }}:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Build and test translation node
+        shell: bash
+        run: |
+          . /opt/ros/${{ matrix.ros_distro }}/setup.bash
+          mkdir -p /opt/px4_ws/src
+          cd /opt/px4_ws/src
+          ln -s ${GITHUB_WORKSPACE} px4
+          cd ..
+          colcon build --packages-select px4_msgs translation_node
+          colcon test --packages-select translation_node
+
+  # ═══════════════════════════════════════════════════════════════════
+  # TIER 5: Full Build Matrix (30-60 min, AWS 8cpu)
+  # Only runs on main/stable/beta/release branches or tags
+  # This is the most expensive job - builds all board targets
+  # ═══════════════════════════════════════════════════════════════════
+
+  build-all-targets-gate:
+    name: Full Build Check
+    needs: [sitl-tests, ros-integration-tests, mavros-mission-tests, mavros-offboard-tests, ros-translation-node]
+    if: |
+      always() &&
+      (github.ref == 'refs/heads/main' ||
+       github.ref == 'refs/heads/stable' ||
+       github.ref == 'refs/heads/beta' ||
+       startsWith(github.ref, 'refs/heads/release/') ||
+       startsWith(github.ref, 'refs/tags/v')) &&
+      needs.sitl-tests.result == 'success' &&
+      needs.ros-integration-tests.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build All Targets Gate Passed
+        run: echo "All prerequisites passed, proceeding with full build matrix"
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+
+  # Note: The actual build-all-targets job will be triggered separately
+  # by modifying the existing build_all_targets.yml workflow
+  # to depend on this orchestrator completing successfully
+
+  # ═══════════════════════════════════════════════════════════════════
+  # SUMMARY JOB
+  # Reports overall status
+  # ═══════════════════════════════════════════════════════════════════
+
+  ci-summary:
+    name: CI Summary
+    needs: [gate-checks, python-checks, basic-tests, clang-tidy, ubuntu-builds, macos-build, sitl-tests, ros-integration-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Tier 1 Status
+        run: |
+          echo "Tier 1 (Gate Checks): ${{ needs.gate-checks.result }}"
+          echo "Tier 1 (Python): ${{ needs.python-checks.result }}"
+
+      - name: Check Tier 2 Status
+        run: |
+          echo "Tier 2 (Basic Tests): ${{ needs.basic-tests.result }}"
+          echo "Tier 2 (Clang-Tidy): ${{ needs.clang-tidy.result }}"
+
+      - name: Check Tier 3 Status
+        run: |
+          echo "Tier 3 (Ubuntu Builds): ${{ needs.ubuntu-builds.result }}"
+          echo "Tier 3 (MacOS Build): ${{ needs.macos-build.result }}"
+
+      - name: Check Tier 4 Status
+        run: |
+          echo "Tier 4 (SITL Tests): ${{ needs.sitl-tests.result }}"
+          echo "Tier 4 (ROS Integration): ${{ needs.ros-integration-tests.result }}"
+
+      - name: Overall Result
+        run: |
+          if [ "${{ needs.gate-checks.result }}" != "success" ] || [ "${{ needs.python-checks.result }}" != "success" ]; then
+            echo "❌ Failed at Tier 1 (Gate Checks) - Stopped early to save costs"
+            exit 1
+          elif [ "${{ needs.basic-tests.result }}" != "success" ] || [ "${{ needs.clang-tidy.result }}" != "success" ]; then
+            echo "❌ Failed at Tier 2 (Basic Builds) - Stopped before expensive jobs"
+            exit 1
+          elif [ "${{ needs.ubuntu-builds.result }}" != "success" ] || [ "${{ needs.macos-build.result }}" != "success" ]; then
+            echo "❌ Failed at Tier 3 (Platform Builds) - Stopped before integration tests"
+            exit 1
+          elif [ "${{ needs.sitl-tests.result }}" != "success" ] || [ "${{ needs.ros-integration-tests.result }}" != "success" ]; then
+            echo "❌ Failed at Tier 4 (Integration Tests)"
+            exit 1
+          else
+            echo "✅ All CI tiers passed successfully!"
+          fi
