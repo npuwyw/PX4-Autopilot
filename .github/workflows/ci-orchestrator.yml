@@ -84,9 +84,61 @@ jobs:
         run: flake8 test/mavsdk_tests/*.py
 
   # ═══════════════════════════════════════════════════════════════════
-  # TIER 2: Basic Builds & Static Analysis (10-15 min, GitHub-hosted)
+  # TIER 2: Basic Builds & Static Analysis (10-15 min, AWS 4cpu)
   # Only runs if Tier 1 passes completely
+  # Uses RunsOn S3 cache for fast ccache sharing across all jobs
   # ═══════════════════════════════════════════════════════════════════
+
+  build-sitl:
+    name: Build px4_sitl_default (for cache)
+    needs: [gate-checks, mavsdk-python-checks]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    container:
+      image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
+    steps:
+      - uses: runs-on/action@v2
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git ownership workaround
+        run: git config --system --add safe.directory '*'
+
+      - name: Cache Restore
+        id: cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: sitl-ccache-${{ github.sha }}
+          restore-keys: |
+            sitl-ccache-${{ github.base_ref || github.ref_name }}-
+            sitl-ccache-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 120M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+          ccache -z
+
+      - name: Build px4_sitl_default
+        run: make px4_sitl_default
+
+      - name: Show ccache stats
+        run: ccache -s
+
+      - name: Cache Save
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: sitl-ccache-${{ github.sha }}
 
   basic-tests:
     name: Basic Tests [${{ matrix.check }}]
@@ -117,11 +169,13 @@ jobs:
 
   clang-tidy:
     name: Clang-Tidy Static Analysis
-    needs: [gate-checks, mavsdk-python-checks]
-    runs-on: ubuntu-latest
+    needs: [build-sitl]
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
     container:
       image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -129,8 +183,31 @@ jobs:
       - name: Git ownership workaround
         run: git config --system --add safe.directory '*'
 
+      - name: Cache Restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: sitl-ccache-${{ github.sha }}
+          restore-keys: |
+            sitl-ccache-${{ github.base_ref || github.ref_name }}-
+            sitl-ccache-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 120M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+
       - name: make px4_sitl_default
         run: make px4_sitl_default
+
+      - name: Show ccache stats after build
+        run: ccache -s
 
       - name: make clang-tidy
         run: make clang-tidy
@@ -139,10 +216,12 @@ jobs:
     name: EKF Functional Change Indicator
     needs: [gate-checks, mavsdk-python-checks]
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
     container:
       image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -160,7 +239,7 @@ jobs:
   nuttx-env-config:
     name: NuttX Environment Config
     needs: [gate-checks, mavsdk-python-checks]
-    runs-on: ubuntu-latest
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
     container:
       image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
     strategy:
@@ -168,6 +247,8 @@ jobs:
       matrix:
         config: [px4_fmu-v5_default]
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -201,6 +282,8 @@ jobs:
     container:
       image: ${{ matrix.container }}
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -208,13 +291,36 @@ jobs:
       - name: Setup environment
         run: |
           apt-get update
-          apt-get install -y git make cmake python3 python3-pip
+          apt-get install -y git make cmake python3 python3-pip ccache
 
       - name: Install PX4 dependencies
         run: ./Tools/setup/ubuntu.sh --no-nuttx --no-sim-tools
 
+      - name: Cache Restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: sitl-ccache-${{ github.sha }}
+          restore-keys: |
+            sitl-ccache-${{ github.base_ref || github.ref_name }}-
+            sitl-ccache-
+
+      - name: Configure ccache
+        run: |
+          mkdir -p ~/.ccache
+          echo "base_dir = ${GITHUB_WORKSPACE}" > ~/.ccache/ccache.conf
+          echo "compression = true" >> ~/.ccache/ccache.conf
+          echo "compression_level = 6" >> ~/.ccache/ccache.conf
+          echo "max_size = 120M" >> ~/.ccache/ccache.conf
+          echo "hash_dir = false" >> ~/.ccache/ccache.conf
+          echo "compiler_check = content" >> ~/.ccache/ccache.conf
+          ccache -s
+
       - name: Build px4_sitl_default
         run: make px4_sitl_default
+
+      - name: Show ccache stats
+        run: ccache -s
 
   macos-build:
     name: MacOS Build [${{ matrix.config }}]
@@ -289,6 +395,8 @@ jobs:
     container:
       image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -318,6 +426,8 @@ jobs:
     container:
       image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -340,10 +450,12 @@ jobs:
     name: Failsafe Web Simulator
     needs: [basic-tests, clang-tidy, ekf-functional-check, nuttx-env-config]
     if: always() && needs.basic-tests.result == 'success' && needs.clang-tidy.result == 'success' && (needs.ekf-functional-check.result == 'success' || needs.ekf-functional-check.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
     container:
       image: px4io/px4-dev:v1.16.0-rc1-258-g0369abd556
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -384,6 +496,8 @@ jobs:
           # For PRs, only run iris. For main, run all models
           - {model: "iris", latitude: "59.617693", longitude: "-151.145316", altitude: "48", build_type: "RelWithDebInfo"}
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -391,16 +505,14 @@ jobs:
       - name: Git Ownership Workaround
         run: git config --system --add safe.directory '*'
 
-      - id: set-timestamp
-        name: Set timestamp for cache
-        run: echo "::set-output name=timestamp::$(date +"%Y%m%d%H%M%S")"
-
-      - name: Cache Key Config
-        uses: actions/cache@v4
+      - name: Cache Restore
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
-          key: sitl-ccache-${{ steps.set-timestamp.outputs.timestamp }}
-          restore-keys: sitl-ccache-
+          key: sitl-ccache-${{ github.sha }}
+          restore-keys: |
+            sitl-ccache-${{ github.base_ref || github.ref_name }}-
+            sitl-ccache-
 
       - name: Cache Conf Config
         run: |
@@ -487,6 +599,8 @@ jobs:
       image: px4io/px4-dev-ros2-galactic:2021-09-08
       options: --privileged --ulimit core=-1 --security-opt seccomp=unconfined
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -598,10 +712,12 @@ jobs:
     name: MAVROS Mission Tests
     needs: [ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
     if: always() && needs.ubuntu-builds.result == 'success' && needs.macos-build.result == 'success' && needs.itcm-check.result == 'success' && needs.flash-analysis.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu22-full-x64,"run-id=${{ github.run_id }}",spot=false]
     container:
       image: px4io/px4-dev-ros-noetic:2021-09-08
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -624,10 +740,12 @@ jobs:
     name: MAVROS Offboard Tests
     needs: [ubuntu-builds, macos-build, itcm-check, flash-analysis, failsafe-sim]
     if: always() && needs.ubuntu-builds.result == 'success' && needs.macos-build.result == 'success' && needs.itcm-check.result == 'success' && needs.flash-analysis.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: [runs-on,runner=4cpu-linux-x64,image=ubuntu22-full-x64,"run-id=${{ github.run_id }}",spot=false]
     container:
       image: px4io/px4-dev-ros-noetic:2021-09-08
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -662,6 +780,8 @@ jobs:
     container:
       image: px4io/px4-dev-ros2-${{ matrix.ros_distro }}:latest
     steps:
+      - uses: runs-on/action@v2
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -716,7 +836,7 @@ jobs:
 
   ci-summary:
     name: CI Summary
-    needs: [gate-checks, mavsdk-python-checks, basic-tests, clang-tidy, ubuntu-builds, macos-build, sitl-tests, ros-integration-tests]
+    needs: [gate-checks, mavsdk-python-checks, build-sitl, basic-tests, clang-tidy, ubuntu-builds, macos-build, sitl-tests, ros-integration-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -727,6 +847,7 @@ jobs:
 
       - name: Check Tier 2 Status
         run: |
+          echo "Tier 2 (Build SITL): ${{ needs.build-sitl.result }}"
           echo "Tier 2 (Basic Tests): ${{ needs.basic-tests.result }}"
           echo "Tier 2 (Clang-Tidy): ${{ needs.clang-tidy.result }}"
 
@@ -745,7 +866,7 @@ jobs:
           if [ "${{ needs.gate-checks.result }}" != "success" ] || [ "${{ needs.mavsdk-python-checks.result }}" != "success" ]; then
             echo "❌ Failed at Tier 1 (Gate Checks) - Stopped early to save costs"
             exit 1
-          elif [ "${{ needs.basic-tests.result }}" != "success" ] || [ "${{ needs.clang-tidy.result }}" != "success" ]; then
+          elif [ "${{ needs.build-sitl.result }}" != "success" ] || [ "${{ needs.basic-tests.result }}" != "success" ] || [ "${{ needs.clang-tidy.result }}" != "success" ]; then
             echo "❌ Failed at Tier 2 (Basic Builds) - Stopped before expensive jobs"
             exit 1
           elif [ "${{ needs.ubuntu-builds.result }}" != "success" ] || [ "${{ needs.macos-build.result }}" != "success" ]; then
